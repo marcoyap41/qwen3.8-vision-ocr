@@ -5,17 +5,23 @@
 ```powershell
 # Install dependencies
 pip install streamlit groq pillow python-dotenv
+
+# If you use uv (ALTERNATIVE OPTION)
+uv sync 
 ```
 
 ## Setup API Key
-```powershell
+```env
 # Add your Groq API Key inside .env file
 GROQ_API_KEY=your_groq_api_key_here
 ```
 
 ## How to run app
-```
+```powershell
 streamlit run app.py
+
+# If you used uv 
+uv run streamlit run app.py
 ```
 
 > marcoyap41
