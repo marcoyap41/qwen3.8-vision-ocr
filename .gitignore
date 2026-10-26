@@ -11,3 +11,10 @@ wheels/
 
 # Environment variables
 .env
+
+# Frontend
+node_modules/
+frontend/dist/
+
+# Temporary files
+temp_uploaded_image.jpg
