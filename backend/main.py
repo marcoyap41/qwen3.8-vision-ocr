@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import base64
 import io
 import json
@@ -9,7 +10,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from groq import AsyncGroq
+from groq import AsyncGroq, RateLimitError
 from PIL import Image, ImageOps
 
 load_dotenv()
@@ -86,17 +87,58 @@ def build_messages(base64_image: str, prompt: str) -> list[dict]:
     ]
 
 
-async def create_completion(client: AsyncGroq, messages: list[dict], stream: bool):
-    return await client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
-        temperature=0.6,
-        max_completion_tokens=2048,
-        top_p=0.95,
-        reasoning_effort="default",
-        stream=stream,
-        stop=None,
-    )
+async def create_raw_completion(client: AsyncGroq, messages: list[dict], stream: bool):
+    max_tokens = 900
+    for attempt in range(3):
+        try:
+            return await client.chat.completions.with_raw_response.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.6,
+                max_completion_tokens=max_tokens,
+                top_p=0.95,
+                reasoning_effort="default",
+                stream=stream,
+                stop=None,
+            )
+        except RateLimitError as err:
+            if attempt == 2:
+                raise
+            msg = str(err)
+            match = re.search(r"Limit\s+(\d+),\s+Requested\s+(\d+)", msg)
+            if match:
+                limit_val = int(match.group(1))
+                max_tokens = max(256, min(max_tokens, limit_val - 50))
+            await asyncio.sleep(2.5 * (attempt + 1))
+
+
+def extract_rate_limits(headers) -> dict:
+    def to_int(key: str):
+        val = headers.get(key)
+        try:
+            return int(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "limit_tokens": to_int("x-ratelimit-limit-tokens"),
+        "remaining_tokens": to_int("x-ratelimit-remaining-tokens"),
+        "reset_tokens": headers.get("x-ratelimit-reset-tokens"),
+        "limit_requests": to_int("x-ratelimit-limit-requests"),
+        "remaining_requests": to_int("x-ratelimit-remaining-requests"),
+        "reset_requests": headers.get("x-ratelimit-reset-requests"),
+    }
+
+
+def extract_usage(usage_obj) -> dict | None:
+    if not usage_obj:
+        return None
+    return {
+        "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
+        "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
+        "total_tokens": getattr(usage_obj, "total_tokens", 0),
+        "total_time": round(float(getattr(usage_obj, "total_time", 0.0) or 0.0), 3),
+    }
 
 
 def strip_think(text: str) -> str:
@@ -120,7 +162,15 @@ def parse_json(raw: str):
         try:
             return ast.literal_eval(text)
         except Exception:
-            return None
+            objects = []
+            for match in re.finditer(r"\{[^{}]*\}", text):
+                try:
+                    obj = json.loads(match.group(0))
+                    if isinstance(obj, dict) and ("bbox_2d" in obj or "bbox" in obj):
+                        objects.append(obj)
+                except Exception:
+                    continue
+            return objects if objects else None
 
 
 def normalize_boxes(parsed, width: int, height: int) -> list[dict]:
@@ -149,20 +199,32 @@ def normalize_boxes(parsed, width: int, height: int) -> list[dict]:
     if len(items) % 2 == 0 and half > 0 and [t for t, _ in items[:half]] == [t for t, _ in items[half:]]:
         items = items[:half]
 
+    longest = float(max(width, height))
+    scale_x = 1000.0 * width / longest
+    scale_y = 1000.0 * height / longest
+
+    filtered = []
+    for idx, (text, coords) in enumerate(items):
+        x1, y1, x2, y2 = coords
+        if idx > 0 and (max(x1, x2) > scale_x * 1.08 or max(y1, y2) > scale_y * 1.08):
+            continue
+        filtered.append((text, coords))
+
+    if filtered:
+        items = filtered
+
     max_value = max(max(coords) for _, coords in items)
     if max_value <= 1.0:
-        scale_x, scale_y = 1.0, 1.0
+        sx, sy = 1.0, 1.0
     elif max_value <= 1000.0:
-        longest = float(max(width, height))
-        scale_x = 1000.0 * width / longest
-        scale_y = 1000.0 * height / longest
+        sx, sy = scale_x, scale_y
     else:
-        scale_x, scale_y = float(width), float(height)
+        sx, sy = float(width), float(height)
 
     boxes = []
     for text, (x1, y1, x2, y2) in items:
-        nx1, nx2 = sorted((x1 / scale_x, x2 / scale_x))
-        ny1, ny2 = sorted((y1 / scale_y, y2 / scale_y))
+        nx1, nx2 = sorted((x1 / sx, x2 / sx))
+        ny1, ny2 = sorted((y1 / sy, y2 / sy))
         boxes.append({
             "text": text,
             "box": [
@@ -175,12 +237,19 @@ def normalize_boxes(parsed, width: int, height: int) -> list[dict]:
     return boxes
 
 
-async def stream_without_think(completion):
+async def stream_events(completion, rate_limit: dict):
+    yield json.dumps({"type": "rate_limit", "data": rate_limit}) + "\n"
+
     buffer = ""
     in_think = False
     open_tag, close_tag = "<think>", "</think>"
+    usage_data = None
 
     async for chunk in completion:
+        x_groq = getattr(chunk, "x_groq", None)
+        if x_groq and getattr(x_groq, "usage", None):
+            usage_data = extract_usage(x_groq.usage)
+
         if not chunk.choices:
             continue
         buffer += chunk.choices[0].delta.content or ""
@@ -197,7 +266,7 @@ async def stream_without_think(completion):
                 start = buffer.find(open_tag)
                 if start != -1:
                     if start > 0:
-                        yield buffer[:start]
+                        yield json.dumps({"type": "token", "text": buffer[:start]}) + "\n"
                     buffer = buffer[start + len(open_tag):]
                     in_think = True
                     continue
@@ -207,12 +276,15 @@ async def stream_without_think(completion):
                         safe = len(buffer) - i
                         break
                 if safe > 0:
-                    yield buffer[:safe]
+                    yield json.dumps({"type": "token", "text": buffer[:safe]}) + "\n"
                 buffer = buffer[safe:]
                 break
 
     if buffer and not in_think:
-        yield buffer
+        yield json.dumps({"type": "token", "text": buffer}) + "\n"
+
+    if usage_data:
+        yield json.dumps({"type": "usage", "data": usage_data}) + "\n"
 
 
 @app.get("/api/health")
@@ -230,18 +302,22 @@ async def ocr_full(file: UploadFile = File(...)):
     base64_image, _, _ = await prepare_image(file)
 
     try:
-        completion = await create_completion(client, build_messages(base64_image, FULL_PAGE_PROMPT), stream=True)
+        raw_response = await create_raw_completion(
+            client, build_messages(base64_image, FULL_PAGE_PROMPT), stream=True
+        )
+        rate_limit = extract_rate_limits(raw_response.headers)
+        completion = await raw_response.parse()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
 
     async def generator():
         try:
-            async for text in stream_without_think(completion):
-                yield text
+            async for event in stream_events(completion, rate_limit):
+                yield event
         except Exception as e:
-            yield f"\n\n[Stream error: {e}]"
+            yield json.dumps({"type": "error", "detail": str(e)}) + "\n"
 
-    return StreamingResponse(generator(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(generator(), media_type="application/x-ndjson")
 
 
 @app.post("/api/ocr/spotting")
@@ -250,11 +326,23 @@ async def ocr_spotting(file: UploadFile = File(...)):
     base64_image, width, height = await prepare_image(file)
 
     try:
-        completion = await create_completion(client, build_messages(base64_image, SPOTTING_PROMPT), stream=False)
+        raw_response = await create_raw_completion(
+            client, build_messages(base64_image, SPOTTING_PROMPT), stream=False
+        )
+        rate_limit = extract_rate_limits(raw_response.headers)
+        completion = await raw_response.parse()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
 
     raw = completion.choices[0].message.content or ""
     boxes = normalize_boxes(parse_json(raw), width, height)
+    usage = extract_usage(getattr(completion, "usage", None))
 
-    return {"boxes": boxes, "raw": strip_think(raw), "width": width, "height": height}
+    return {
+        "boxes": boxes,
+        "raw": strip_think(raw),
+        "width": width,
+        "height": height,
+        "usage": usage,
+        "rate_limit": rate_limit,
+    }
